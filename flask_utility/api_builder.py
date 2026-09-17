@@ -477,11 +477,24 @@ class ApiBuilder:
             else:
                 hook(*arguments)
 
+    def _inject_view_args(self, data, route_values):
+        """Copy route ``view_args`` into the write payload when absent.
+
+        Keeps nested writes (e.g. ``POST /products/<id>/images``) scoped
+        to the URL without requiring the client to repeat the parent key.
+        """
+        for argument, field_name in self.view_args.items():
+            if argument in route_values and field_name not in data:
+                data[field_name] = route_values[argument]
+        return data
+
     def _collection(self, **route_values):
         self._validate_view_args(route_values)
         if request.method == 'POST':
             try:
-                data = request.get_json(silent=True) or {}
+                data = self._inject_view_args(
+                    request.get_json(silent=True) or {}, route_values
+                )
                 item = self._load(data)
                 self._run_hooks('before_create', item, data, route_values)
                 self.session.add(item)
@@ -538,7 +551,9 @@ class ApiBuilder:
             return '', 204
 
         try:
-            data = request.get_json(silent=True) or {}
+            data = self._inject_view_args(
+                request.get_json(silent=True) or {}, route_values
+            )
             self._load(data, instance=item, partial=True)
             self._run_hooks('before_update', item, data, route_values)
             self.session.commit()
@@ -584,10 +599,9 @@ class ApiBuilder:
             return '', 204
 
         try:
-            data = request.get_json(silent=True) or {}
-            for argument, field_name in self.view_args.items():
-                if argument in route_values and field_name not in data:
-                    data[field_name] = route_values[argument]
+            data = self._inject_view_args(
+                request.get_json(silent=True) or {}, route_values
+            )
             if item is None:
                 item = self._load(data)
                 self._run_hooks('before_create', item, data, route_values)
