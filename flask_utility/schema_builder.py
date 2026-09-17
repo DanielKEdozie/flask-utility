@@ -6,6 +6,75 @@ from sqlalchemy import inspect as sa_inspect
 from .extension import resolve_ma, resolve_session
 
 
+#: Top-level keys of the new-style ``relationships`` auto-configuration
+#: mapping: ``{'only': ..., 'exclude': ..., 'rel_fields': {...}}``.
+_AUTO_RELATIONSHIP_KEYS = frozenset(('only', 'exclude', 'rel_fields'))
+
+#: Per-field options accepted inside ``rel_fields`` entries besides
+#: ``only``/``exclude``. These are applied to the generated nested field
+#: (``write=False`` means response-only, i.e. Marshmallow ``dump_only``).
+_REL_FIELD_FLAGS = frozenset((
+    'write', 'read_only', 'dump_only', 'load_only', 'required', 'allow_none',
+))
+
+#: All keys accepted inside ``rel_fields`` entries. ``depth`` renders that
+#: field's subtree as if built with ``SchemaBuilder(..., depth=<value>)``,
+#: i.e. at most ``depth`` levels of that field (``0`` disables nesting of
+#: the field entirely, leaving a flat leaf).
+_REL_FIELD_KEYS = (
+    _AUTO_RELATIONSHIP_KEYS | _REL_FIELD_FLAGS | frozenset(('depth',))
+)
+
+
+def _is_auto_relationship_config(value):
+    """Return True when ``relationships`` uses the auto-config shape.
+
+    New style::
+
+        relationships={
+            'only': ('parent', 'children'),
+            'exclude': ('products',),
+            'rel_fields': {
+                'parent': {'only': ('id', 'name'), 'write': False},
+            },
+        }
+
+    Anything else (field names mapped to schemas, builders, or explicit
+    configuration dicts) is treated as legacy explicit nested definitions.
+    """
+    if not isinstance(value, dict) or not value:
+        return False
+    if set(value) - _AUTO_RELATIONSHIP_KEYS:
+        return False
+    for key, item in value.items():
+        if key in ('only', 'exclude'):
+            if item is None:
+                continue
+            if isinstance(item, dict) or isinstance(item, str):
+                return False
+            try:
+                fields = tuple(item)
+            except TypeError:
+                return False
+            if any(not isinstance(name, str) for name in fields):
+                return False
+        elif key == 'rel_fields':
+            if not isinstance(item, dict):
+                return False
+            for field_config in item.values():
+                if not isinstance(field_config, dict):
+                    return False
+                if set(field_config) - _REL_FIELD_KEYS:
+                    return False
+                field_depth = field_config.get('depth')
+                if (
+                    field_depth is not None
+                    and (isinstance(field_depth, bool) or not isinstance(field_depth, int))
+                ):
+                    return False
+    return True
+
+
 class SchemaBuilder:
     """Build a ``marshmallow-sqlalchemy`` schema for a SQLAlchemy model.
 
@@ -66,71 +135,83 @@ class SchemaBuilder:
 
     ``auto_relationships``
         When true, discover SQLAlchemy relationships from the model and build
-        nested schemas automatically. Explicit entries in ``relationships``
+        nested schemas automatically. Explicit entries in ``nested_schema``
         take precedence. It is disabled by default so response shapes remain
-        intentional.
+        intentional. Per-relationship tuning lives in ``relationships``.
 
-    ``relationship_exclude``
-        Mapping of relationship field names to nested fields to exclude. The
-        alias ``exclude_from_relationship`` is also accepted::
+    ``relationships``
+        Auto-relationship configuration mapping with ``only`` and
+        ``exclude`` keys selecting which relationship attributes are
+        declared. Per-field configuration lives in the top-level
+        ``rel_fields`` argument::
 
             SchemaBuilder(
                 Category,
                 auto_relationships=True,
-                relationship_exclude={
-                    'parent': ('children',),
-                    'children': ('parent',),
+                depth=4,
+                relationships={'exclude': ('products',)},
+                rel_fields={
+                    'parent': {
+                        'only': ('id', 'name', 'slug'),
+                        'write': False,
+                    },
+                    'children': {
+                        'exclude': ('parent',),
+                        'depth': 3,
+                    },
                 },
             )
 
-    ``relationship_only``
-        Mapping of relationship field names to nested fields to include.
-        ``include_relationships`` limits which relationship attributes are
-        declared on this schema, while ``exclude_relationships`` removes
-        relationship attributes. The aliases ``include_rel_only`` and
-        ``rel_exclude`` are also accepted::
+        For backwards compatibility, a ``rel_fields`` key inside this
+        mapping is still accepted (top-level ``rel_fields`` wins on
+        conflict), as is a mapping of relationship field names to
+        schemas/builders/config dicts, which behaves like
+        ``nested_schema``. The ``relationship_only``,
+        ``relationship_exclude``, ``include_relationships``, and
+        ``exclude_relationships`` keyword arguments (plus their aliases) are
+        also still accepted; values from ``relationships`` take precedence.
 
-            SchemaBuilder(
+    ``rel_fields``
+        Per-field relationship configuration, mapping a field name to
+        ``{'only': ..., 'exclude': ..., 'write': ..., 'depth': ...}``
+        options. ``only``/``exclude`` control that field's nested schema,
+        ``write`` its writability (``write=False`` means response-only),
+        and ``depth`` renders that field's subtree as if built with that
+        global ``depth`` (``0`` leaves a flat leaf). Applies at every level
+        of the auto-built tree.
+
+    ``nested_schema``
+        Explicit nested/custom schema definitions, mapping a relationship
+        field name to a schema class, a ``SchemaBuilder``, a schema
+        instance, or a configuration dictionary. A configuration dictionary
+        may provide ``schema`` or ``model``. When ``model`` is provided, a
+        private nested ``SchemaBuilder`` is created and does not register
+        anything globally. Set ``many=True`` for collection relationships.
+        Use ``write=False`` or ``read_only=True`` to make a nested attribute
+        response-only. The equivalent Marshmallow option is
+        ``dump_only=True``. Use ``load_only=True`` for request-only nested
+        data. Dictionaries also accept ``only`` and ``exclude`` to control
+        the nested schema independently of the parent schema::
+
+            user_schema = SchemaBuilder(User)
+            part_schema = SchemaBuilder(
                 Part,
-                auto_relationships=True,
-                include_relationships=('category', 'images'),
-                exclude_relationships=('vendor',),
-                relationship_only={'category': ('id', 'name')},
-                relationship_exclude={'images': ('internal_path',)},
+                nested_schema={
+                    'owner': user_schema,
+                    'images': {
+                        'model': Image,
+                        'schema_name': 'PartImageSchema',
+                        'many': True,
+                        'only': ('id', 'url'),
+                        'write': False,
+                    },
+                    'secret': {
+                        'schema': SecretSchema,
+                        'exclude': ('internal_value',),
+                        'dump_only': True,
+                    },
+                },
             )
-
-    ``relationships``
-        Mapping of relationship field name to a schema class, a
-        ``SchemaBuilder``, a schema instance, or a configuration dictionary.
-        A configuration dictionary may provide ``schema`` or ``model``. When
-        ``model`` is provided, a private nested ``SchemaBuilder`` is created
-        and does not register anything globally. Set ``many=True``
-        for collection relationships. Use ``write=False`` or
-        ``read_only=True`` to make a nested attribute response-only. The
-        equivalent Marshmallow option is ``dump_only=True``. Use
-        ``load_only=True`` for request-only nested data. Relationship
-        dictionaries also accept ``only`` and ``exclude`` to control the
-        nested schema independently of the parent schema::
-
-        user_schema = SchemaBuilder(User)
-        part_schema = SchemaBuilder(
-            Part,
-            relationships={
-                'owner': user_schema,
-                'images': {
-                    'model': Image,
-                    'schema_name': 'PartImageSchema',
-                    'many': True,
-                    'only': ('id', 'url'),
-                    'write': False,
-                },
-                'secret': {
-                    'schema': SecretSchema,
-                    'exclude': ('internal_value',),
-                    'dump_only': True,
-                },
-            },
-        )
 
         A string in ``schema`` is treated as ``schema_name`` when ``model``
         is also provided. A string without ``model`` cannot be resolved
@@ -232,7 +313,9 @@ class SchemaBuilder:
         exclude_relationships=None,
         include_rel_only=None,
         rel_exclude=None,
-        relationships=None, # {name, schemaBuilder or SchemaName}
+        relationships=None, # {only, exclude} (+ legacy rel_fields)
+        rel_fields=None, # {field: {only, exclude, write, depth}}
+        nested_schema=None, # {name: SchemaBuilder, schema class/instance, or config dict}
         custom_fields=None, # create custom fields or override fields,
         methods=None, # {name, function},
         custom_validators=None, # {name, function},
@@ -260,7 +343,27 @@ class SchemaBuilder:
             exclude_relationships: Relationship attributes to exclude.
             include_rel_only: Alias for include_relationships.
             rel_exclude: Alias for exclude_relationships.
-            relationships: Explicit nested relationship field definitions.
+            relationships: Auto-relationship configuration
+                ``{'only': ..., 'exclude': ...}``. ``only``/``exclude``
+                select which relationship attributes are declared.
+                Per-field configuration lives in ``rel_fields``; a
+                ``rel_fields`` key here is still accepted for backwards
+                compatibility (top-level ``rel_fields`` wins on conflict).
+                A legacy mapping of field names to schemas/builders/config
+                dicts is still accepted and behaves like ``nested_schema``.
+            rel_fields: Per-field relationship configuration mapping a
+                field name to
+                ``{'only': ..., 'exclude': ..., 'write': ..., 'depth': ...}``
+                options. ``only``/``exclude`` control that field's nested
+                schema, ``write`` its writability (``write=False`` means
+                response-only), and ``depth`` renders that field's subtree
+                as if built with that global ``depth`` (``0`` leaves a
+                flat leaf). Applies at every level of the auto-built tree.
+            nested_schema: Explicit nested/custom schema definitions mapping
+                a relationship field name to a schema class, a
+                ``SchemaBuilder``, a schema instance, or a configuration
+                dictionary (same forms as the legacy ``relationships``).
+                Explicit entries take precedence over auto-built ones.
             custom_fields: Marshmallow fields to add or replace.
             methods: Computed output fields mapped to callables.
             custom_validators: Field validators mapped by field name.
@@ -275,27 +378,88 @@ class SchemaBuilder:
         self.load_only = tuple(load_only or ())
         self.depth = depth
         self.auto_relationships = auto_relationships
+        raw_relationships = dict(relationships or {})
+        self.nested_schema = dict(nested_schema or {})
+        auto_config = {}
+        if raw_relationships:
+            if _is_auto_relationship_config(raw_relationships):
+                auto_config = raw_relationships
+            else:
+                # Legacy shape: explicit per-field schema definitions.
+                # Fold them into nested_schema (explicit nested_schema wins).
+                self.nested_schema = {**raw_relationships, **self.nested_schema}
+        # Deprecated alias kept for introspection; nested_schema is canonical.
+        self.relationships = dict(self.nested_schema)
+        # Per-field config: top-level rel_fields wins over the nested
+        # relationships={'rel_fields': ...} form (both still accepted).
+        self.rel_fields = {
+            **dict(auto_config.get('rel_fields') or {}),
+            **dict(rel_fields or {}),
+        }
+        for field, config in self.rel_fields.items():
+            if not isinstance(config, dict):
+                raise ValueError(
+                    "rel_fields {!r} must map to a configuration dict".format(field)
+                )
+            if set(config) - _REL_FIELD_KEYS:
+                raise ValueError(
+                    "rel_fields {!r} has unknown keys: {}".format(
+                        field, sorted(set(config) - _REL_FIELD_KEYS)
+                    )
+                )
+            field_depth = config.get('depth')
+            if field_depth is not None and (
+                isinstance(field_depth, bool)
+                or not isinstance(field_depth, int)
+                or field_depth < 0
+            ):
+                raise ValueError(
+                    "rel_fields {!r} depth must be a non-negative integer".format(field)
+                )
+        self.rel_field_options = {
+            field: {
+                key: value
+                for key, value in config.items()
+                if key in _REL_FIELD_FLAGS
+            }
+            for field, config in self.rel_fields.items()
+        }
+        self.rel_field_options = {
+            field: options
+            for field, options in self.rel_field_options.items()
+            if options
+        }
         self.relationship_exclude = dict(
             relationship_exclude
             if relationship_exclude is not None
             else exclude_from_relationship or {}
         )
         self.relationship_only = dict(relationship_only or {})
-        configured_includes = (
-            include_relationships
-            if include_relationships is not None
-            else include_rel_only
-        )
-        configured_excludes = (
-            exclude_relationships
-            if exclude_relationships is not None
-            else rel_exclude
-        )
+        for field, config in self.rel_fields.items():
+            if config.get('only') is not None:
+                self.relationship_only[field] = config['only']
+            if config.get('exclude') is not None:
+                self.relationship_exclude[field] = config['exclude']
+        if 'only' in auto_config:
+            configured_includes = auto_config['only']
+        else:
+            configured_includes = (
+                include_relationships
+                if include_relationships is not None
+                else include_rel_only
+            )
+        if 'exclude' in auto_config:
+            configured_excludes = auto_config['exclude']
+        else:
+            configured_excludes = (
+                exclude_relationships
+                if exclude_relationships is not None
+                else rel_exclude
+            )
         self.include_relationships = (
             set(configured_includes) if configured_includes is not None else None
         )
         self.exclude_relationships = set(configured_excludes or ())
-        self.relationships = dict(relationships or {})
         self.custom_fields = dict(custom_fields or {})
         self.methods = dict(methods or {})
         self.custom_validators = dict(custom_validators or {})
@@ -474,7 +638,7 @@ class SchemaBuilder:
         return result
 
     def _relationship_fields(self):
-        relationship_configs = dict(self.relationships)
+        relationship_configs = dict(self.nested_schema)
         if self.auto_relationships and self.depth > 0:
             inherited = {}
             if self.exclude_relationships:
@@ -485,8 +649,17 @@ class SchemaBuilder:
                 inherited['relationship_exclude'] = dict(self.relationship_exclude)
             if self.relationship_only:
                 inherited['relationship_only'] = dict(self.relationship_only)
+            if self.rel_fields:
+                # Re-parsed by each nested builder, so per-field config
+                # applies at every level of the auto-built tree.
+                inherited['relationships'] = {
+                    'rel_fields': {
+                        name: dict(config)
+                        for name, config in self.rel_fields.items()
+                    }
+                }
             for name, relationship in sa_inspect(self.model).relationships.items():
-                relationship_configs.setdefault(name, dict({
+                entry = dict({
                     'model': relationship.mapper.class_,
                     'many': relationship.uselist,
                     'schema_name': '{}{}Schema'.format(
@@ -495,7 +668,18 @@ class SchemaBuilder:
                     'auto_relationships': True,
                     'depth': self.depth - 1,
                     'write': False,
-                }, **inherited))
+                }, **inherited)
+                if name in self.rel_field_options:
+                    entry.update(self.rel_field_options[name])
+                field_depth = self.rel_fields.get(name, {}).get('depth')
+                if field_depth is not None:
+                    # Per-field depth uses the same units as the global
+                    # depth: the field's subtree renders as if built with
+                    # SchemaBuilder(..., depth=field_depth). Consuming one
+                    # level for this nesting keeps depths decreasing so the
+                    # tree always terminates.
+                    entry['depth'] = min(entry['depth'], field_depth - 1)
+                relationship_configs.setdefault(name, entry)
 
         if self.include_relationships is not None:
             relationship_configs = {
