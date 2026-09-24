@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flask-utility"
+name = "flask-api-builder"
 version = "2.0.0"
-description = "Reusable Flask utilities: convention-based CRUD API builder, SQLAlchemy schema builder, and model event system (auto-slug)."
+description = "Convention-based CRUD API builder for Flask, SQLAlchemy, and Marshmallow."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,14 +14,14 @@ dependencies = [
     "flask",
     "flask-sqlalchemy",
     "flask-marshmallow",
-    "marshmallow-sqlalchemy",
-    "python-slugify",
+    "marshmallow",
+    "sqlalchemy",
+    "werkzeug",
 ]
 
 [project.optional-dependencies]
-forms = ["wtforms-alchemy"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["flask_utility*"]
+include = ["flask_api_builder*"]

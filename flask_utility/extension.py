@@ -13,6 +13,18 @@ Builders accept explicit ``db_session`` / ``ma`` arguments that take
 precedence over the extension (handy for tests or multiple databases).
 When neither is given, they resolve through the extension bound to the
 current Flask app.
+
+Global error shapes can be configured once on the extension and
+overridden per :class:`ApiBuilder`::
+
+    utility = FlaskUtility(errors={
+        404: lambda error, ctx: {'success': False, 'message': 'Not found'},
+        422: lambda error, ctx: {'success': False, 'errors': getattr(error, 'messages', str(error))},
+    })
+
+Per-builder ``errors`` are merged over these globals (builder wins per
+status code / alias). See :class:`flask_utility.api_builder.ApiBuilder`
+for the full ``errors`` / ``responses`` / ``overrides`` contract.
 """
 from flask import current_app, has_app_context
 
@@ -35,15 +47,17 @@ class FlaskUtility:
         utility.init_app(app)
     """
 
-    def __init__(self, app=None, db=None, ma=None):
+    def __init__(self, app=None, db=None, ma=None, errors=None, responses=None):
         global _default_instance
         self._db = db
         self._ma = ma
+        self._errors = dict(errors or {})
+        self._responses = dict(responses or {})
         _default_instance = self
         if app is not None:
             self.init_app(app)
 
-    def init_app(self, app, db=None, ma=None):
+    def init_app(self, app, db=None, ma=None, errors=None, responses=None):
         """Bind to ``app``, optionally (re)setting ``db`` and ``ma``.
 
         Args:
@@ -51,15 +65,34 @@ class FlaskUtility:
             db: Flask-SQLAlchemy instance (provides ``db.session``).
             ma: Flask-Marshmallow instance (provides
                 ``ma.SQLAlchemyAutoSchema``).
+            errors: Optional mapping of HTTP status code (``400``,
+                ``404``, ``422``, ``500``, ...) or alias
+                (``'validation'``, ``'not_found'``, ``'generic'``,
+                ``'http'``) to ``handler(error, ctx)``. Merged under
+                per-builder ``errors`` (builder wins per key).
+            responses: Optional mapping of semantic action
+                (``'list'``, ``'paginated'``, ``'collection'``,
+                ``'create'``, ``'retrieve'``, ``'update'``, ``'patch'``,
+                ``'delete'``) to ``handler(data, ctx)``. Merged under
+                per-builder ``responses`` (builder wins per key).
         """
         global _default_instance
         if db is not None:
             self._db = db
         if ma is not None:
             self._ma = ma
+        if errors is not None:
+            self._errors = dict(errors)
+        if responses is not None:
+            self._responses = dict(responses)
         app.extensions = getattr(app, 'extensions', {})
         app.extensions['flask_utility'] = self
         _default_instance = self
+        try:
+            from .events import init_model_events
+            init_model_events()
+        except Exception:
+            pass
 
     # -- accessors --------------------------------------------------------
 
@@ -78,6 +111,16 @@ class FlaskUtility:
         """Shortcut for ``db.session`` (or ``None`` when unbound)."""
         db = self._db
         return getattr(db, 'session', None) if db is not None else None
+
+    @property
+    def errors(self):
+        """Global error-handler mapping (may be empty)."""
+        return dict(getattr(self, '_errors', {}) or {})
+
+    @property
+    def responses(self):
+        """Global response-handler mapping (may be empty)."""
+        return dict(getattr(self, '_responses', {}) or {})
 
 
 def get_extension():
@@ -122,3 +165,19 @@ def resolve_ma(ma=None):
             'FlaskUtility().init_app(app, ma=ma).'
         )
     return instance
+
+
+def resolve_errors():
+    """Return global error-handler mapping (empty dict when unbound)."""
+    extension = get_extension()
+    if extension is None:
+        return {}
+    return dict(getattr(extension, 'errors', {}) or {})
+
+
+def resolve_responses():
+    """Return global response-handler mapping (empty dict when unbound)."""
+    extension = get_extension()
+    if extension is None:
+        return {}
+    return dict(getattr(extension, 'responses', {}) or {})
